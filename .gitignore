@@ -2,10 +2,11 @@ node_modules
 dist
 
 # MATLAB outputs
-storage/panoramas/
-storage/depth_maps/
-storage/logs/
-storage/raw_images/
+matlab/storage/panoramas/
+matlab/storage/depth_maps/
+matlab/storage/logs/
+matlab/storage/raw_images/
+matlab/storage/processed_images/
 
 # MATLAB temp files
 *.asv
