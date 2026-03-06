@@ -12,8 +12,15 @@ function processedImages = preprocessImages(images)
     processedImages = cell(1, numImages);
 
     % Establish target resolution from the first valid image, capped to
-    % prevent memory issues with high-resolution drone imagery
-    MAX_DIM = 1600;  % max pixels on longest edge
+    % prevent memory issues with high-resolution drone imagery.
+    % For large batches (>20 images) use a lower cap to conserve RAM.
+    if numImages > 20
+        MAX_DIM = 1200;
+        fprintf('Large batch detected (%d images): capping resolution to %dpx for memory efficiency.\n', ...
+            numImages, MAX_DIM);
+    else
+        MAX_DIM = 1600;  % max pixels on longest edge
+    end
     refImg = images{1};
     targetHeight = size(refImg, 1);
     targetWidth  = size(refImg, 2);

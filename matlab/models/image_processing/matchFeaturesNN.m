@@ -1,7 +1,11 @@
 function [indexPairs, matchedPoints1, matchedPoints2] = matchFeaturesNN(features1, features2, points1, points2)
 % MATCHFEATURESNN Nearest-neighbor feature matching with automatic metric selection
-%   Handles both binary descriptors (AKAZE/ORB/BRISK → Hamming distance)
+%   Handles both binary descriptors (AKAZE/FREAK/ORB/BRISK → Hamming distance)
 %   and float descriptors (SURF/KAZE → SSD distance) transparently.
+%
+%   Thresholds are tuned for aerial/drone survey imagery:
+%   - High MatchThreshold: accept more candidates; MSAC filters bad ones
+%   - High MaxRatio: relaxed Lowe ratio test for partial-overlap shots
 %
 % Inputs:
 %    features1, features2 - Descriptor blocks from extractDescriptors()
@@ -11,21 +15,24 @@ function [indexPairs, matchedPoints1, matchedPoints2] = matchFeaturesNN(features
 %    matchedPoints1  - Matched keypoints from image 1
 %    matchedPoints2  - Matched keypoints from image 2
 
-    % Detect descriptor type and set appropriate matching parameters
     if isa(features1, 'binaryFeatures')
-        % Binary descriptors (AKAZE, ORB, BRISK, FREAK) use Hamming distance
-        % Threshold 30 balances recall vs outlier rejection for aerial images
+        % Binary descriptors (FREAK / ORB / BRISK) — Hamming distance 0-100%.
+        % MatchThreshold = 80: accept pairs with up to 80% bit mismatch.
+        %   For FREAK 512-bit descriptors, true matches typically differ <40%;
+        %   raising the ceiling increases raw recall and lets RANSAC filter.
+        % MaxRatio = 0.9: relaxed Lowe ratio test for aerial imagery where
+        %   second-best matches are often truly similar (repetitive textures).
         indexPairs = matchFeatures(features1, features2, ...
             'Unique', true, ...
-            'MatchThreshold', 30, ...
-            'MaxRatio', 0.6, ...
+            'MatchThreshold', 80, ...
+            'MaxRatio', 0.9, ...
             'Method', 'Approximate');
     else
-        % Float descriptors (SURF, KAZE) use SSD/SAD distance
+        % Float descriptors (SURF, KAZE) — SSD/SAD distance.
         indexPairs = matchFeatures(features1, features2, ...
             'Unique', true, ...
-            'MatchThreshold', 1.5, ...
-            'MaxRatio', 0.6, ...
+            'MatchThreshold', 10.0, ...
+            'MaxRatio', 0.85, ...
             'Method', 'Approximate');
     end
 

@@ -23,7 +23,7 @@ function main(varargin)
     % =====================================================================
     %  CONFIGURATION — Defaults + user overrides
     % =====================================================================
-    config = defaultConfig(projectRoot);
+    config = defaultConfig(matlabDir);
 
     if nargin >= 2 && isstruct(varargin{2})
         userCfg = varargin{2};
@@ -75,7 +75,7 @@ function main(varargin)
     tui.log('INPUT', sprintf('Source: %s', imageDir));
 
     % Ensure output directories exist
-    outputDirs = {config.outputDir, config.depthDir, config.logDir};
+    outputDirs = {config.outputDir, config.depthDir, config.logDir, config.processedDir};
     for d = 1:numel(outputDirs)
         if ~isfolder(outputDirs{d})
             mkdir(outputDirs{d});
@@ -141,88 +141,178 @@ function main(varargin)
         tui.timing('Feature Extraction', toc(t2));
 
         % ------ PHASE 3 : GEOMETRIC ESTIMATION ------
-        tui.phase('3/5', 'HOMOGRAPHY ESTIMATION');
+        tui.phase('3/5', 'HOMOGRAPHY ESTIMATION & CLUSTERING');
 
         t3 = tic;
-        tforms(numImages) = projective2d(eye(3));
-        matchCounts = zeros(1, numImages);
+
+        % --- Step 3a: Build match graph (sequential + global fallback) ---
+        % We store edge lists for graph construction.
+        srcNodes = [];
+        dstNodes = [];
+        edgeCounts = [];  % number of matches per edge (for logging)
 
         for i = 2:numImages
-            tui.log('MATCH', sprintf('Pair %d→%d — nearest-neighbor matching...', i-1, i));
-            [indexPairs, matchedPts1, matchedPts2] = matchFeaturesNN( ...
+            tui.log('MATCH', sprintf('Pair %d→%d — sequential matching...', i-1, i));
+            [indexPairs, ~, ~] = matchFeaturesNN( ...
                 features{i-1}, features{i}, points{i-1}, points{i});
-            matchCounts(i) = size(indexPairs, 1);
-            tui.log('MATCH', sprintf('  → %d correspondences found', matchCounts(i)));
+            n = size(indexPairs, 1);
+            tui.log('MATCH', sprintf('  → %d correspondences found', n));
 
-            if matchCounts(i) < 4
-                tui.log('WARN', sprintf('  ⚠ Too few matches (%d < 4). Skipping pair.', matchCounts(i)));
-                tforms(i) = tforms(i-1);
+            if n >= 4
+                srcNodes(end+1) = i-1;  %#ok<AGROW>
+                dstNodes(end+1) = i;    %#ok<AGROW>
+                edgeCounts(end+1) = n;  %#ok<AGROW>
+            else
+                % --- Fallback: global search against all earlier images ---
+                tui.log('WARN', sprintf('  ⚠ Too few matches (%d < 4). Running global fallback search...', n));
+                bestN = 0;
+                bestJ = -1;
+                for j = 1:i-2
+                    [ip2, ~, ~] = matchFeaturesNN( ...
+                        features{j}, features{i}, points{j}, points{i});
+                    nj = size(ip2, 1);
+                    if nj > bestN
+                        bestN = nj;
+                        bestJ = j;
+                    end
+                end
+                if bestN >= 4
+                    tui.log('MATCH', sprintf('  ✔ Fallback: image %d connects to image %d (%d matches)', i, bestJ, bestN));
+                    srcNodes(end+1) = bestJ;   %#ok<AGROW>
+                    dstNodes(end+1) = i;       %#ok<AGROW>
+                    edgeCounts(end+1) = bestN; %#ok<AGROW>
+                else
+                    tui.log('WARN', sprintf('  ✘ No connection found for image %d across all previous images.', i));
+                end
+            end
+        end
+
+        % --- Step 3b: Find connected components (clusters) ---
+        if isempty(srcNodes)
+            % No valid matches at all — treat every image as its own cluster
+            tui.log('WARN', 'No valid matches found across any image pair. Each image is its own cluster.');
+            clusterBins = 1:numImages;
+        else
+            G = graph(srcNodes, dstNodes, edgeCounts, numImages);
+            clusterBins = conncomp(G);  % clusterBins(i) = cluster index for image i
+        end
+
+        numClusters = max(clusterBins);
+        tui.log('CLUSTER', sprintf('Identified %d image cluster(s):', numClusters));
+        for k = 1:numClusters
+            clusterIdx = find(clusterBins == k);
+            tui.log('CLUSTER', sprintf('  Cluster %d: images [%s]', k, num2str(clusterIdx)));
+        end
+
+        tui.timing('Homography Estimation & Clustering', toc(t3));
+
+        % ------ PHASE 4 & 5 : RECONSTRUCTION + DEPTH (per cluster) ------
+        tui.phase('4/5', 'IMAGE RECONSTRUCTION (per cluster)');
+        tui.phase('5/5', 'DEPTH ESTIMATION & VISUALIZATION (per cluster)');
+
+        t45 = tic;
+        timestampStr = string(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+        panoramaFiles = {};  % collect output paths for summary
+        depthFiles    = {};
+        totalEdgeMatches = sum(edgeCounts);
+
+        for k = 1:numClusters
+            clusterIdx = find(clusterBins == k);
+
+            if numel(clusterIdx) < 2
+                tui.log('SKIP', sprintf('Cluster %d has only 1 image — skipping reconstruction.', k));
                 continue;
             end
 
-            tui.log('HOMOGRAPHY', sprintf('Pair %d→%d — MSAC estimation...', i-1, i));
-            tforms(i) = estimateHomography(matchedPts1, matchedPts2, tforms(i-1));
+            tui.separator();
+            tui.log('CLUSTER', sprintf('Processing Cluster %d/%d  (%d images: [%s])', ...
+                k, numClusters, numel(clusterIdx), num2str(clusterIdx)));
+
+            % Extract images/points/features for this cluster
+            clusterImages   = images(clusterIdx);
+            clusterPoints   = points(clusterIdx);
+            clusterFeatures = features(clusterIdx);
+            nCluster        = numel(clusterIdx);
+
+            % --- Compute homographies relative to first image of the cluster ---
+            tui.log('HOMOGRAPHY', sprintf('Computing homographies for cluster %d...', k));
+            % Pre-fill the entire array with identity transforms so every
+            % element is defined even if estimation falls back.
+            clusterTforms = repmat(projective2d(eye(3)), 1, nCluster);
+            for ci = 2:nCluster
+                tui.log('MATCH', sprintf('  Cluster %d — Pair %d→%d...', k, ci-1, ci));
+                [~, mp1c, mp2c] = matchFeaturesNN( ...
+                    clusterFeatures{ci-1}, clusterFeatures{ci}, ...
+                    clusterPoints{ci-1},   clusterPoints{ci});
+                if size(mp1c.Location, 1) >= 4
+                    clusterTforms(ci) = estimateHomography(mp1c, mp2c, clusterTforms(ci-1));
+                else
+                    tui.log('WARN', sprintf('    Too few matches for pair %d→%d inside cluster %d; carrying forward.', ci-1, ci, k));
+                    clusterTforms(ci) = clusterTforms(ci-1);
+                end
+            end
+
+            % --- Reconstruction (Phase 4) ---
+            tui.log('ALIGN', sprintf('  Building panorama for cluster %d...', k));
+            if strcmpi(config.blendMethod, 'multiband')
+                panorama = generatePanorama(clusterImages, clusterTforms, 'multiband');
+            else
+                [panorama, mask] = alignImages(clusterImages, clusterTforms);
+                panorama = multiBandBlend(panorama, mask);
+            end
+
+            panoramaFile = fullfile(config.outputDir, ...
+                sprintf('panorama_cluster_%d_%s.png', k, timestampStr));
+            imwrite(panorama, panoramaFile);
+            panoramaFiles{end+1} = panoramaFile; %#ok<AGROW>
+            tui.log('SAVE', sprintf('  Panorama saved: %s', panoramaFile));
+            
+            processedFile = fullfile(config.processedDir, ...
+                sprintf('final_model_cluster_%d_%s.png', k, timestampStr));
+            imwrite(panorama, processedFile);
+            tui.log('SAVE', sprintf('  Final model saved to processed_images: %s', processedFile));
+
+            tui.log('SAVE', sprintf('  Resolution: %d × %d px', size(panorama, 2), size(panorama, 1)));
+
+            % --- Visualization ---
+            tui.log('VIZ', sprintf('  Displaying cluster %d panorama...', k));
+            showPanorama(panorama);
+
+            % Show feature matches for first pair in this cluster
+            if nCluster >= 2
+                [~, mp1v, mp2v] = matchFeaturesNN( ...
+                    clusterFeatures{1}, clusterFeatures{2}, ...
+                    clusterPoints{1},   clusterPoints{2});
+                showFeatureMatches(clusterImages{1}, clusterImages{2}, mp1v, mp2v, ...
+                    sprintf('Feature Matches — Cluster %d (Image %d ↔ %d)', ...
+                            k, clusterIdx(1), clusterIdx(2)));
+            end
+
+            % --- Depth Estimation (Phase 5) ---
+            if config.enableDepth
+                tui.log('DEPTH', sprintf('  Computing depth map for cluster %d...', k));
+                depthMap = depthEstimation(panorama);
+
+                depthFile = fullfile(config.depthDir, ...
+                    sprintf('depth_cluster_%d_%s.png', k, timestampStr));
+                imwrite(depthMap, depthFile);
+                depthFiles{end+1} = depthFile; %#ok<AGROW>
+                tui.log('SAVE', sprintf('  Depth map saved: %s', depthFile));
+
+                showDepthMap(depthMap);
+                showPointCloud(depthMap, panorama, ...
+                    sprintf('3D Point Cloud — Cluster %d Reconstruction', k));
+
+                clear depthMap;
+            else
+                tui.log('DEPTH', sprintf('  Depth estimation disabled (cluster %d skipped).', k));
+            end
+
+            % Free large cluster arrays to conserve RAM before the next iteration
+            clear panorama mask clusterImages clusterPoints clusterFeatures clusterTforms;
         end
 
-        tui.timing('Homography Estimation', toc(t3));
-
-        % ------ PHASE 4 : RECONSTRUCTION ------
-        tui.phase('4/5', 'IMAGE RECONSTRUCTION');
-
-        t4 = tic;
-        tui.log('ALIGN', 'Warping images onto global canvas...');
-        [panorama, mask] = alignImages(images, tforms);
-
-        tui.log('BLEND', sprintf('Blending with method: %s', config.blendMethod));
-        if strcmpi(config.blendMethod, 'multiband')
-            panorama = generatePanorama(images, tforms, 'multiband');
-        else
-            panorama = multiBandBlend(panorama, mask);
-        end
-
-        % Save panorama
-        panoramaFile = fullfile(config.outputDir, ...
-            sprintf('panorama_%s.png', string(datetime('now', 'Format', 'yyyyMMdd_HHmmss'))));
-        imwrite(panorama, panoramaFile);
-        tui.log('SAVE', sprintf('Panorama saved: %s', panoramaFile));
-        tui.log('SAVE', sprintf('Resolution: %d × %d px', size(panorama, 2), size(panorama, 1)));
-
-        tui.timing('Reconstruction', toc(t4));
-
-        % ------ PHASE 5 : DEPTH & VISUALIZATION ------
-        tui.phase('5/5', 'DEPTH ESTIMATION & VISUALIZATION');
-
-        t5 = tic;
-        if config.enableDepth
-            tui.log('DEPTH', 'Computing multi-view depth map...');
-            depthMap = depthEstimation(images, tforms);
-
-            depthFile = fullfile(config.depthDir, ...
-                sprintf('depth_%s.png', string(datetime('now', 'Format', 'yyyyMMdd_HHmmss'))));
-            imwrite(depthMap, depthFile);
-            tui.log('SAVE', sprintf('Depth map saved: %s', depthFile));
-        else
-            depthMap = [];
-            tui.log('DEPTH', 'Depth estimation disabled (config.enableDepth = false)');
-        end
-
-        % --- Visualization Windows ---
-        tui.log('VIZ', 'Opening result windows...');
-        showPanorama(panorama);
-
-        if config.enableDepth && ~isempty(depthMap)
-            showDepthMap(depthMap);
-            showPointCloud(depthMap, images{1});
-        end
-
-        % Show feature matches for first pair
-        if numImages >= 2
-            [~, mp1, mp2] = matchFeaturesNN(features{1}, features{2}, points{1}, points{2});
-            showFeatureMatches(images{1}, images{2}, mp1, mp2, ...
-                'Feature Matches — Image 1 ↔ 2');
-        end
-
-        tui.timing('Depth & Visualization', toc(t5));
+        tui.timing('Reconstruction & Depth (all clusters)', toc(t45));
 
         % =====================================================================
         %  SUMMARY
@@ -231,12 +321,14 @@ function main(varargin)
         tui.separator();
         tui.log('DONE', '═══ PIPELINE COMPLETE ═══');
         tui.log('STATS', sprintf('Images processed:    %d', numImages));
-        tui.log('STATS', sprintf('Total matches:       %d', sum(matchCounts)));
-        tui.log('STATS', sprintf('Panorama resolution: %d × %d', size(panorama, 2), size(panorama, 1)));
+        tui.log('STATS', sprintf('Clusters found:      %d', numClusters));
+        tui.log('STATS', sprintf('Total edge matches:  %d', totalEdgeMatches));
         tui.log('STATS', sprintf('Total time:          %.2f seconds', totalTime));
-        tui.log('OUTPUT', sprintf('Panorama: %s', panoramaFile));
-        if config.enableDepth && ~isempty(depthMap)
-            tui.log('OUTPUT', sprintf('Depth:    %s', depthFile));
+        for pf = 1:numel(panoramaFiles)
+            tui.log('OUTPUT', sprintf('Panorama %d: %s', pf, panoramaFiles{pf}));
+        end
+        for df = 1:numel(depthFiles)
+            tui.log('OUTPUT', sprintf('Depth    %d: %s', df, depthFiles{df}));
         end
         tui.separator();
 
@@ -260,13 +352,17 @@ end
 % =========================================================================
 %  DEFAULT CONFIGURATION
 % =========================================================================
-function config = defaultConfig(projectRoot)
+function config = defaultConfig(matlabDir)
     config.detector     = 'AKAZE';      % Feature detector: AKAZE | SURF | KAZE | FAST | HARRIS | ORB
     config.blendMethod  = 'multiband';  % Blend method: multiband | simple
     config.enableDepth  = true;         % Enable depth estimation
-    config.maxImages    = 0;            % Max images to process (0 = all). Set to 15-30 for large datasets
+    config.maxImages    = 0;            % Max images to process (0 = all)
     config.maxWorkers   = 4;            % Max parallel workers (reserved for future parfor)
-    config.outputDir    = fullfile(projectRoot, 'storage', 'panoramas');
-    config.depthDir     = fullfile(projectRoot, 'storage', 'depth_maps');
-    config.logDir       = fullfile(projectRoot, 'storage', 'logs');
+    
+    % Ensure files save explicitly inside matlab/storage/
+    baseStorageDir      = fullfile(matlabDir, 'storage');
+    config.outputDir    = fullfile(baseStorageDir, 'panoramas');
+    config.depthDir     = fullfile(baseStorageDir, 'depth_maps');
+    config.logDir       = fullfile(baseStorageDir, 'logs');
+    config.processedDir = fullfile(baseStorageDir, 'processed_images');
 end

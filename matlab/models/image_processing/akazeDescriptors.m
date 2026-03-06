@@ -43,22 +43,26 @@ function [points, features] = akazeDescriptors(img)
     end
 
     % --- Step 1: KAZE Detection (nonlinear diffusion scale space) ---
+    % Use a low threshold (0.0003) to detect abundant features even in
+    % low-contrast regions (roads, rooftops). The 5000-point cap below
+    % takes only the strongest, so low threshold = better coverage.
     kazePoints = detectKAZEFeatures(detectImg, ...
-        'Threshold', 0.0005, ...
+        'Threshold', 0.0003, ...
         'NumOctaves', 4, ...
         'NumScaleLevels', 4);
 
-    % Adaptive threshold fallback for low-texture images
-    if kazePoints.Count < 50
+    % Adaptive threshold fallback for very low-texture images (e.g. foggy frames)
+    if kazePoints.Count < 100
         kazePoints = detectKAZEFeatures(detectImg, ...
-            'Threshold', 0.0001, ...
+            'Threshold', 0.00005, ...
             'NumOctaves', 4, ...
             'NumScaleLevels', 4);
         fprintf('AKAZE: Relaxed threshold -> %d keypoints\n', kazePoints.Count);
     end
 
-    % Cap keypoints to strongest N
-    maxPoints = 3000;
+    % Cap keypoints to strongest N — increased from 3000 to 5000 so that
+    % adjacent images sharing 60-80% of the scene have more overlap candidates.
+    maxPoints = 5000;
     if kazePoints.Count > maxPoints
         kazePoints = kazePoints.selectStrongest(maxPoints);
     end
@@ -81,5 +85,5 @@ function [points, features] = akazeDescriptors(img)
         points = validPoints;
     end
 
-    fprintf('AKAZE: %d keypoints detected (KAZE + binary descriptors)\n', points.Count);
+    fprintf('AKAZE: %d keypoints detected (KAZE + FREAK descriptors)\n', points.Count);
 end
