@@ -18,10 +18,7 @@ function [indexPairs, matchedPoints1, matchedPoints2] = matchFeaturesNN(features
     if isa(features1, 'binaryFeatures')
         % Binary descriptors (FREAK / ORB / BRISK) — Hamming distance 0-100%.
         % MatchThreshold = 80: accept pairs with up to 80% bit mismatch.
-        %   For FREAK 512-bit descriptors, true matches typically differ <40%;
-        %   raising the ceiling increases raw recall and lets RANSAC filter.
-        % MaxRatio = 0.9: relaxed Lowe ratio test for aerial imagery where
-        %   second-best matches are often truly similar (repetitive textures).
+        % MaxRatio = 0.9: relaxed Lowe ratio test
         indexPairs = matchFeatures(features1, features2, ...
             'Unique', true, ...
             'MatchThreshold', 80, ...

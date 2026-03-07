@@ -111,17 +111,25 @@ function [panorama, mask] = alignImages(images, tforms)
         warpedWeight = double(bwdist(~warpedMask));
         warpedWeight = warpedWeight / max(warpedWeight(:) + eps);
 
+        % for c = 1:3
+        %     pChannel = double(panorama(:,:,c));
+        %     wChannel = double(warpedImg(:,:,c));
+        %     totalWeight = blendWeight + warpedWeight;
+        %     totalWeight(totalWeight == 0) = 1;  % avoid div by zero
+
+        %     blended = (pChannel .* blendWeight + wChannel .* warpedWeight) ./ totalWeight;
+        %     panorama(:,:,c) = cast(blended, 'like', images{1});
+        % end
+
+        % blendWeight = blendWeight + warpedWeight;
+        useNew = warpedWeight > blendWeight;
         for c = 1:3
-            pChannel = double(panorama(:,:,c));
-            wChannel = double(warpedImg(:,:,c));
-            totalWeight = blendWeight + warpedWeight;
-            totalWeight(totalWeight == 0) = 1;  % avoid div by zero
-
-            blended = (pChannel .* blendWeight + wChannel .* warpedWeight) ./ totalWeight;
-            panorama(:,:,c) = cast(blended, 'like', images{1});
+            pChannel = panorama(:,:,c);
+            wChannel = warpedImg(:,:,c);
+            pChannel(useNew) = wChannel(useNew);
+            panorama(:,:,c) = pChannel;
         end
-
-        blendWeight = blendWeight + warpedWeight;
+        blendWeight(useNew) = warpedWeight(useNew);
         mask = mask | warpedMask;
     end
 end

@@ -41,7 +41,11 @@ function pipelineResult = reconstructionPipeline(imageDir, outputDir, detector)
     % --- 3. Reconstruction Module ---
     disp('Aligning images and generating panorama...');
     [panorama, mask] = alignImages(images, tforms);
-    panorama = multiBandBlend(panorama, mask);
+    
+    % Enforce exactly 1920x1080 dimensions and maximize clarity
+    disp('Resizing and sharpening panorama to 1920x1080...');
+    panorama = imresize(panorama, [1080, 1920], 'lanczos3');
+    panorama = imsharpen(panorama, 'Radius', 2, 'Amount', 1.5, 'Threshold', 0.01);
     
     % Save result
     outputFile = fullfile(outputDir, 'stitched_panorama.png');
