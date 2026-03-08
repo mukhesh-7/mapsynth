@@ -30,22 +30,103 @@ function pipelineResult = reconstructionPipeline(imageDir, outputDir, detector)
         [points{i}, features{i}] = extractDescriptors(images{i}, detector);
     end
     
-    % Match features between consecutive image pairs
+    % Match features between all pairs to build a robust spanning tree
+    disp('Matching features across all image pairs to find optimal connections...');
     tforms(numImages) = projective2d(eye(3));
+    matchScores = zeros(numImages, numImages);
+    matchesI = cell(numImages, numImages);
+    matchesJ = cell(numImages, numImages);
+
+    % Compute pairwise matches
+    for i = 1:numImages
+        for j = i+1:numImages
+            [~, ptsI, ptsJ] = matchFeaturesNN(features{i}, features{j}, points{i}, points{j});
+            numMatches = size(ptsI, 1);
+            matchScores(i, j) = numMatches;
+            matchScores(j, i) = numMatches;
+            matchesI{i, j} = ptsI;
+            matchesJ{i, j} = ptsJ;
+            matchesI{j, i} = ptsJ;
+            matchesJ{j, i} = ptsI;
+        end
+    end
     
-    for i = 2:numImages
-        [~, matchedPoints1, matchedPoints2] = matchFeaturesNN(features{i-1}, features{i}, points{i-1}, points{i});
-        tforms(i) = estimateHomography(matchedPoints1, matchedPoints2, tforms(i-1));
+    % Build Maximum Spanning Tree to connect images resiliently
+    added = false(1, numImages);
+    validTransformsIdx = true(1, numImages);
+    
+    [maxVal, linearIdx] = max(matchScores(:));
+    if maxVal == 0 || isempty(maxVal)
+        warning('No valid matches found across any images!');
+        added(1) = true; % Fallback
+    else
+        [idx1, ~] = ind2sub(size(matchScores), linearIdx);
+        added(idx1) = true;
+    end
+    
+    if sum(added) == 0
+        added(1) = true;
+    end
+    
+    % Iteratively add the best matching unadded image
+    for step = 2:numImages
+        bestScore = -1;
+        bestAdded = -1;
+        bestUnadded = -1;
+        
+        for i = 1:numImages
+            if added(i)
+                for j = 1:numImages
+                    if ~added(j)
+                        if matchScores(i, j) > bestScore
+                            bestScore = matchScores(i, j);
+                            bestAdded = i;
+                            bestUnadded = j;
+                        end
+                    end
+                end
+            end
+        end
+        
+        fprintf('Connecting image %d to %d (Score: %d)\n', bestUnadded, bestAdded, bestScore);
+        
+        ptsAdded = matchesI{bestAdded, bestUnadded};
+        ptsUnadded = matchesJ{bestAdded, bestUnadded};
+        
+        % Estimate homography to the newly selected image
+        [tformStep, isValid] = estimateHomography(ptsAdded, ptsUnadded, tforms(bestAdded));
+        
+        tforms(bestUnadded) = tformStep;
+        validTransformsIdx(bestUnadded) = isValid;
+        
+        if ~isValid
+            warning('Failed to estimate reliable transform for image %d. It will be excluded from the final panorama.', bestUnadded);
+        end
+        
+        added(bestUnadded) = true;
+    end
+    
+    % Filter out invalid images to avoid a jumbled output entirely
+    validImages = images(validTransformsIdx);
+    validTforms = tforms(validTransformsIdx);
+    
+    if isempty(validImages)
+        error('All images failed to align properly.');
     end
     
     % --- 3. Reconstruction Module ---
     disp('Aligning images and generating panorama...');
-    [panorama, mask] = alignImages(images, tforms);
+    [panorama, ~] = alignImages(validImages, validTforms);
     
-    % Enforce exactly 1920x1080 dimensions and maximize clarity
-    disp('Resizing and sharpening panorama to 1920x1080...');
-    panorama = imresize(panorama, [1080, 1920], 'lanczos3');
-    panorama = imsharpen(panorama, 'Radius', 2, 'Amount', 1.5, 'Threshold', 0.01);
+    % Resize proportionally to prevent aspect ratio distortion (squashing), but cap the max dimension
+    disp('Applying sharpening and proportional resizing to preserve natural geometry...');
+    [h, w, ~] = size(panorama);
+    maxDim = 3840; % Allow up to 4K resolution rather than forcing 1080p
+    if max(h, w) > maxDim
+        scaleFactor = maxDim / max(h, w);
+        panorama = imresize(panorama, scaleFactor, 'lanczos3');
+    end
+    panorama = imsharpen(panorama, 'Radius', 2, 'Amount', 1.0, 'Threshold', 0.02);
     
     % Save result
     outputFile = fullfile(outputDir, 'stitched_panorama.png');

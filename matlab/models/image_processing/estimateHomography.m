@@ -1,19 +1,27 @@
-function tform = estimateHomography(matchedPoints1, matchedPoints2, previousTform)
-% ESTIMATEHOMOGRAPHY Robust homography estimation with MSAC and sanity checks
+function [tform, isValid] = estimateHomography(matchedPoints1, matchedPoints2, previousTform)
+% ESTIMATEHOMOGRAPHY Robust homography estimation with projective/affine and sanity checks
 %   Computes the transform between two sets of matched points, validates the 
 %   result for geometric plausibility, and chains it with the previous cumulative transform.
-%
-%   Uses 'similarity' (translation, rotation, uniform scale) instead of
-%   'projective' to prevent severe perspective keystoning ("trapezoid effect")
-%   when chaining dozens of images in an aerial flight path.
 %
 % Inputs:
 %    matchedPoints1, matchedPoints2 - matched keypoint locations
 %    previousTform - cumulative projective2d from prior image pair
 % Outputs:
 %    tform - validated cumulative projective2d transform
+%    isValid - boolean indicating if the transform estimation was successful
 
-    % MSAC estimation using 'similarity' to prevent runaway perspective distortion
+    isValid = true;
+    
+    if size(matchedPoints1, 1) < 4
+        fprintf('  WARNING: Not enough points (%d) to compute homography.\n', size(matchedPoints1, 1));
+        tform = previousTform;
+        isValid = false;
+        return;
+    end
+
+    % Try 'similarity' (translation, rotation, uniform scale)
+    % This is critical to prevent runaway perspective distortion (keystoning/trapezoid effect)
+    % when chaining images in an aerial flight path!
     try
         [tformStep, inlierIdx] = estimateGeometricTransform2D(...
             matchedPoints2, matchedPoints1, ...
@@ -23,46 +31,58 @@ function tform = estimateHomography(matchedPoints1, matchedPoints2, previousTfor
             'MaxDistance', 8);
 
         inlierRatio = sum(inlierIdx) / numel(inlierIdx);
-        fprintf('  Homography: %d/%d inliers (%.0f%%)\n', ...
+        fprintf('  Similarity: %d/%d inliers (%.0f%%)\n', ...
             sum(inlierIdx), numel(inlierIdx), inlierRatio * 100);
 
     catch ex
-        warning('estimateHomography:failed', ...
-            'Transform estimation failed: %s. Using previous transform.', ex.message);
+        fprintf('  Similarity transform failed: %s. Trying affine...\n', ex.message);
+        try
+            [tformStep, inlierIdx] = estimateGeometricTransform2D(...
+                matchedPoints2, matchedPoints1, ...
+                'affine', ...
+                'Confidence', 99.9, ...
+                'MaxNumTrials', 5000, ...
+                'MaxDistance', 8);
+            
+            inlierRatio = sum(inlierIdx) / numel(inlierIdx);
+            fprintf('  Affine: %d/%d inliers (%.0f%%)\n', ...
+                sum(inlierIdx), numel(inlierIdx), inlierRatio * 100);
+        catch ex2
+            warning('estimateHomography:failed', ...
+                'Transform estimation failed completely: %s. Using previous transform.', ex2.message);
+            tform = previousTform;
+            isValid = false;
+            return;
+        end
+    end
+
+    % Check 1: Minimum inlier ratio and count for reliable estimation
+    if inlierRatio < 0.05 || sum(inlierIdx) < 8
+        fprintf('  WARNING: Low inlier count/ratio (%d, %.0f%%) — unreliable estimate.\n', sum(inlierIdx), inlierRatio * 100);
         tform = previousTform;
+        isValid = false;
         return;
     end
 
-    % Convert the resulting affine2d to projective2d for consistent pipeline types
-    H = tformStep.T;
-    detH = det(H(1:2, 1:2)); % Determinant of the rotation/scale part
-
-    isDegenerate = false;
-
-    % Check 1: Determinant must be positive (no image flip).
-    if detH <= 0
-        fprintf('  WARNING: Negative determinant (%.4f) — degenerate transform\n', detH);
-        isDegenerate = true;
-    end
-
-    % Check 2: Extreme scale changes.
-    % Scale changes of up to ×10 / ×0.1 are allowed.
-    if detH > 0 && (detH < 0.01 || detH > 100)
-        fprintf('  WARNING: Extreme scale (det=%.4f)\n', detH);
-        isDegenerate = true;
-    end
-
-    % Check 3: Minimum inlier ratio for reliable estimation.
-    if inlierRatio < 0.05
-        fprintf('  WARNING: Low inlier ratio (%.0f%%) — unreliable estimate\n', inlierRatio * 100);
-        isDegenerate = true;
-    end
-
-    if isDegenerate
-        fprintf('  -> Falling back to previous transform for this pair\n');
-        tform = previousTform;
+    % Convert the resulting transform to projective2d for consistent pipeline types
+    if isa(tformStep, 'affine2d')
+        H = [tformStep.T(1,1:2) 0; tformStep.T(2,1:2) 0; tformStep.T(3,1:2) 1];
     else
-        % Chain pairwise step with the cumulative transform from all prior pairs
-        tform = projective2d(previousTform.T * H);
+        H = tformStep.T;
     end
+    
+    detH = det(H(1:2, 1:2));
+
+    % Check 2: Determinant must be positive (no image flip).
+    % Scale changes of up to ×10 / ×0.1 are allowed.
+    if detH <= 0 || detH < 0.1 || detH > 10
+        fprintf('  WARNING: Invalid scale or negative determinant (%.4f)\n', detH);
+        tform = previousTform;
+        isValid = false;
+        return;
+    end
+
+    % Chain pairwise step with the cumulative transform from all prior pairs
+    % In MATLAB, [u v 1] = [x y 1] * T. So mapping from current to global is H * previousTform.T
+    tform = projective2d(H * previousTform.T);
 end
