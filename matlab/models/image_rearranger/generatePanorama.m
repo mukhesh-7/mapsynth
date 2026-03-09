@@ -124,11 +124,16 @@ function panorama = generatePanorama(images, tforms, blendMethod)
         end
     end
 
-    % --- Step 3: Resize and Sharpen Final Output to 1920x1080 ---
-    % Enforcing precise hardware dimensions and applying subpixel clarity boost
-    fprintf('  Resizing panorama to exactly 1920x1080 pixels...\n');
-    panorama = imresize(panorama, [1080, 1920], 'lanczos3');
+    % --- Step 3: Resize and Sharpen Final Output ---
+    % Scale proportionally to limit the max dimension while retaining true geometric aspect ratio
+    fprintf('  Applying subpixel sharpening and proportional sizing...\n');
+    [fH, fW, ~] = size(panorama);
+    if max(fH, fW) > MAX_DIM
+        scaleFinal = MAX_DIM / max(fH, fW);
+        panorama = imresize(panorama, scaleFinal, 'lanczos3');
+    end
     panorama = imsharpen(panorama, 'Radius', 1.5, 'Amount', 1.0, 'Threshold', 0.01);
     
-    fprintf('Panorama generated: 1920 × 1080 pixels (Crystal Clear)\n');
+    [finalH, finalW, ~] = size(panorama);
+    fprintf('Panorama generated: %d × %d pixels (True Aspect Ratio Preserved)\n', finalW, finalH);
 end

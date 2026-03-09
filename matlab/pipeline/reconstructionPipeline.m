@@ -50,6 +50,76 @@ function pipelineResult = reconstructionPipeline(imageDir, outputDir, detector)
             matchesJ{j, i} = ptsI;
         end
     end
+
+    % --- Auto-correct mirrored/flipped/rotated images ---
+    for i = 1:numImages
+        % If the maximum match score is suspiciously low, test exhaustive geometric states
+        if max(matchScores(i, :)) < 350
+            disp(['Warning: Image ' num2str(i) ' has low max matches (' num2str(max(matchScores(i, :))) '). Testing 5 geometric states...']);
+            
+            bestTransformScore = max(matchScores(i, :));
+            bestTransformImg = images{i};
+            bestTransformPoints = points{i};
+            bestTransformFeatures = features{i};
+            bestTransformMatchesI = matchesI(i, :);
+            bestTransformMatchesJ = matchesJ(i, :);
+            bestTransformMatchScores = matchScores(i, :);
+            transformMade = false;
+            bestTransformName = '';
+            
+            transforms = {@(x) fliplr(x), @(x) flipud(x), @(x) rot90(x, 2), @(x) rot90(x, 1), @(x) rot90(x, -1)};
+            transformNames = {'Flipped Horizontally', 'Flipped Vertically', 'Rotated 180°', 'Rotated 90°', 'Rotated -90°'};
+            
+            for tIdx = 1:length(transforms)
+                transImg = transforms{tIdx}(images{i});
+                [ptsT, featsT] = extractDescriptors(transImg, detector);
+                
+                tempScores = zeros(1, numImages);
+                tempMatchesI = cell(1, numImages);
+                tempMatchesJ = cell(1, numImages);
+                
+                for j = 1:numImages
+                    if i == j; continue; end
+                    [~, pT, pJ] = matchFeaturesNN(featsT, features{j}, ptsT, points{j});
+                    tempScores(j) = size(pT, 1);
+                    tempMatchesI{j} = pT;
+                    tempMatchesJ{j} = pJ;
+                end
+                
+                if max(tempScores) > bestTransformScore * 1.5 && max(tempScores) > 15
+                    bestTransformScore = max(tempScores);
+                    bestTransformImg = transImg;
+                    bestTransformPoints = ptsT;
+                    bestTransformFeatures = featsT;
+                    bestTransformMatchScores = tempScores;
+                    bestTransformMatchesI = tempMatchesI;
+                    bestTransformMatchesJ = tempMatchesJ;
+                    transformMade = true;
+                    bestTransformName = transformNames{tIdx};
+                end
+            end
+            
+            if transformMade
+                disp([' -> Image ' num2str(i) ' [' bestTransformName '] found strong matches! (Score ' num2str(bestTransformScore) '). Permanently correcting geometry.']);
+                
+                images{i} = bestTransformImg;
+                points{i} = bestTransformPoints;
+                features{i} = bestTransformFeatures;
+                
+                for j = 1:numImages
+                    if i == j; continue; end
+                    matchScores(i, j) = bestTransformMatchScores(j);
+                    matchScores(j, i) = bestTransformMatchScores(j);
+                    matchesI{i, j} = bestTransformMatchesI{j};
+                    matchesJ{i, j} = bestTransformMatchesJ{j};
+                    matchesI{j, i} = bestTransformMatchesJ{j};
+                    matchesJ{j, i} = bestTransformMatchesI{j};
+                end
+            else
+                disp([' -> No geometric transformation yielded significantly better matches for Image ' num2str(i) '. Keeping original.']);
+            end
+        end
+    end
     
     % Build Maximum Spanning Tree to connect images resiliently
     added = false(1, numImages);
@@ -68,39 +138,50 @@ function pipelineResult = reconstructionPipeline(imageDir, outputDir, detector)
         added(1) = true;
     end
     
-    % Iteratively add the best matching unadded image
+    % Iteratively add the best matching unadded image using global backtracking aggregation
     for step = 2:numImages
         bestScore = -1;
-        bestAdded = -1;
         bestUnadded = -1;
         
-        for i = 1:numImages
-            if added(i)
-                for j = 1:numImages
-                    if ~added(j)
-                        if matchScores(i, j) > bestScore
-                            bestScore = matchScores(i, j);
-                            bestAdded = i;
-                            bestUnadded = j;
-                        end
+        for j = 1:numImages
+            if ~added(j)
+                scoreJ = 0;
+                for i = 1:numImages
+                    if added(i)
+                        scoreJ = scoreJ + matchScores(i, j);
                     end
+                end
+                if scoreJ > bestScore
+                    bestScore = scoreJ;
+                    bestUnadded = j;
                 end
             end
         end
         
-        fprintf('Connecting image %d to %d (Score: %d)\n', bestUnadded, bestAdded, bestScore);
+        fprintf('Connecting image %d to panorama globally (Total Score: %d)\n', bestUnadded, bestScore);
         
-        ptsAdded = matchesI{bestAdded, bestUnadded};
-        ptsUnadded = matchesJ{bestAdded, bestUnadded};
+        allGlobalPts = [];
+        allUnaddedPts = [];
         
-        % Estimate homography to the newly selected image
-        [tformStep, isValid] = estimateHomography(ptsAdded, ptsUnadded, tforms(bestAdded));
+        for i = 1:numImages
+            if added(i) && matchScores(i, bestUnadded) >= 4
+                ptsI = matchesI{i, bestUnadded};
+                ptsJ = matchesJ{i, bestUnadded};
+                
+                [xG, yG] = transformPointsForward(tforms(i), double(ptsI.Location(:,1)), double(ptsI.Location(:,2)));
+                allGlobalPts = [allGlobalPts; double(xG), double(yG)]; %#ok<AGROW>
+                allUnaddedPts = [allUnaddedPts; double(ptsJ.Location)]; %#ok<AGROW>
+            end
+        end
+        
+        % Estimate homography to the newly combined global points map!
+        [tformStep, isValid] = estimateHomography(allGlobalPts, allUnaddedPts, projective2d(eye(3)));
         
         tforms(bestUnadded) = tformStep;
         validTransformsIdx(bestUnadded) = isValid;
         
         if ~isValid
-            warning('Failed to estimate reliable transform for image %d. It will be excluded from the final panorama.', bestUnadded);
+            warning('Failed to reliably estimate mapping for image %d. It will be excluded from the final panorama.', bestUnadded);
         end
         
         added(bestUnadded) = true;

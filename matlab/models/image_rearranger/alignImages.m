@@ -86,6 +86,7 @@ function [panorama, mask] = alignImages(images, tforms)
     panorama = zeros([height width 3], 'like', images{1});
     mask = false(height, width);
     blendWeight = zeros(height, width);
+    isFirstImage = true;
 
     panoramaView = imref2d([height width], [xMin xMax], [yMin yMax]);
 
@@ -106,30 +107,82 @@ function [panorama, mask] = alignImages(images, tforms)
         warpedMask = imwarp(true(size(currentImg, 1), size(currentImg, 2)), ...
             tforms(i), 'OutputView', panoramaView);
 
-        % Weighted average blending (better than max for overlapping regions)
-        % Distance from mask edge serves as a simple weight
-        warpedWeight = double(bwdist(~warpedMask));
-        warpedWeight = warpedWeight / max(warpedWeight(:) + eps);
+        % Distance from mask edge serves as absolute Voronoi confidence
+        warpedDist = double(bwdist(~warpedMask));
 
-        % for c = 1:3
-        %     pChannel = double(panorama(:,:,c));
-        %     wChannel = double(warpedImg(:,:,c));
-        %     totalWeight = blendWeight + warpedWeight;
-        %     totalWeight(totalWeight == 0) = 1;  % avoid div by zero
-
-        %     blended = (pChannel .* blendWeight + wChannel .* warpedWeight) ./ totalWeight;
-        %     panorama(:,:,c) = cast(blended, 'like', images{1});
-        % end
-
-        % blendWeight = blendWeight + warpedWeight;
-        useNew = warpedWeight > blendWeight;
-        for c = 1:3
-            pChannel = panorama(:,:,c);
-            wChannel = warpedImg(:,:,c);
-            pChannel(useNew) = wChannel(useNew);
-            panorama(:,:,c) = pChannel;
+        if isFirstImage
+            panorama = warpedImg;
+            blendWeight = warpedDist;
+            mask = warpedMask;
+            isFirstImage = false;
+            continue;
         end
-        blendWeight(useNew) = warpedWeight(useNew);
+
+        % Robust Exposure compensation (Mean matching in overlap region)
+        overlapMask = mask & warpedMask;
+        if any(overlapMask(:))
+            wImgD = im2double(warpedImg);
+            pImgD = im2double(panorama);
+            for c = 1:3
+                wChan = wImgD(:,:,c);
+                pChan = pImgD(:,:,c);
+                
+                wMean = mean(wChan(overlapMask));
+                pMean = mean(pChan(overlapMask));
+                
+                % Simple mean shift provides stable exposure compensation
+                wChanAdj = wChan + (pMean - wMean);
+                wChanAdj = max(0, min(1, wChanAdj));
+                wChan(warpedMask) = wChanAdj(warpedMask);
+                wImgD(:,:,c) = wChan;
+            end
+            if isa(images{1}, 'uint8')
+                warpedImg = cast(wImgD * 255, 'like', images{1});
+            else
+                warpedImg = cast(wImgD, 'like', images{1});
+            end
+        end
+
+        % Calculate exact Voronoi boundary
+        % 1 where the new image should take over, 0 where the old image stays
+        newAlpha = double(warpedDist > blendWeight);
+        
+        % Ensure newAlpha is 0 completely outside the new image
+        newAlpha(~warpedMask) = 0;
+        % Ensure newAlpha is 1 completely in empty canvas areas where only new image exists
+        newAlpha(warpedMask & ~mask) = 1;
+        
+        % Soften the cut very slightly to eliminate harsh seam lines
+        % By feathering ONLY near the Voronoi line with a small radius (sigma=1),
+        % we completely avoid wide-radius "ghosting" (overlapped look).
+        blendFilter = fspecial('gaussian', 7, 1.5);
+        smoothAlpha = imfilter(newAlpha, blendFilter, 'replicate');
+        
+        % Lock the boundaries so blending doesn't leak into empty canvas
+        smoothAlpha(~warpedMask) = 0;
+        smoothAlpha(warpedMask & ~mask) = 1;
+        smoothAlpha(~mask & ~warpedMask) = 0;
+        
+        % Perform exactly controlled alpha blending
+        pImgD = im2double(panorama);
+        wImgD = im2double(warpedImg);
+        
+        for c = 1:3
+            pChan = pImgD(:,:,c);
+            wChan = wImgD(:,:,c);
+            
+            pChan = wChan .* smoothAlpha + pChan .* (1 - smoothAlpha);
+            pImgD(:,:,c) = pChan;
+        end
+        
+        if isa(images{1}, 'uint8')
+            panorama = cast(pImgD * 255, 'like', images{1});
+        else
+            panorama = cast(pImgD, 'like', images{1});
+        end
+        
+        % Update state for the next image using exact absolute metric 
+        blendWeight = max(blendWeight, warpedDist);
         mask = mask | warpedMask;
     end
 end

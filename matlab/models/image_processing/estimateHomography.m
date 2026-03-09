@@ -73,10 +73,12 @@ function [tform, isValid] = estimateHomography(matchedPoints1, matchedPoints2, p
     
     detH = det(H(1:2, 1:2));
 
-    % Check 2: Determinant must be positive (no image flip).
+    absDetH = abs(detH);
+    
+    % Check 2: Allow image flips/mirrors (negative determinant).
     % Scale changes of up to ×10 / ×0.1 are allowed.
-    if detH <= 0 || detH < 0.1 || detH > 10
-        fprintf('  WARNING: Invalid scale or negative determinant (%.4f)\n', detH);
+    if absDetH < 0.1 || absDetH > 10
+        fprintf('  WARNING: Invalid scale (det = %.4f)\n', detH);
         tform = previousTform;
         isValid = false;
         return;
