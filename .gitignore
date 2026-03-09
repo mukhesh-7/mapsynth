@@ -7,6 +7,7 @@ matlab/storage/depth_maps/
 matlab/storage/logs/
 matlab/storage/raw_images/
 matlab/storage/processed_images/
+matlab/storage/test_images/
 
 # MATLAB temp files
 *.asv
